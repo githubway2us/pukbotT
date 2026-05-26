@@ -36,6 +36,7 @@ RISK_PER_TRADE = 0.03
 MAX_ACTIVE_TRADES = 6      
 SCAN_INTERVAL = 15 
 BLACKLIST_AUTO_RELEASE_MINUTES = 10 
+TRADE_COOLDOWN_MINUTES = 5 # เพิ่มค่าคงที่สำหรับคูลดาวน์เหรียญที่เพิ่งปิด 5 นาที
 VOL_MULTIPLIER = 1.1      
 
 # New Parameters for TP/SL
@@ -69,6 +70,7 @@ class QuantumUltimateSystem:
         
         # State Management
         self.closed_trades = {}      
+        self.cooldown_trades = {} # เพิ่มพื้นที่เก็บข้อมูลคูลดาวน์สำหรับเหรียญที่เพิ่งปิดสัญญา
         self.market_scores = {} 
         self.market_vol_status = {} 
         self.market_vol_ratio = {}   
@@ -156,9 +158,41 @@ class QuantumUltimateSystem:
                     "active_orders": len(self.active_positions),
                     "last_update": datetime.now().strftime("%H:%M:%S")
                 })
+                # เรียกฟังก์ชันตรวจสอบการปิดสถานะเพื่ออัปเดตระบบคูลดาวน์ 5 นาที
+                self.check_and_update_cooldown()
             except Exception as e:
                 self.log(f"Account Update Fail: {str(e)}", "WARN")
             time.sleep(SCAN_INTERVAL)
+
+    def check_and_update_cooldown(self):
+        """ตรวจสอบออเดอร์ที่พึ่งปิดล่าสุดในตลาด เพื่อนำมาเข้า Cooldown 5 นาทีป้องกันการเข้าซ้ำ"""
+        try:
+            # ตรวจสอบจากเหรียญที่อยู่ในลิสต์สแกนหลักของเรา
+            for symbol in self.symbols:
+                # ถ้ากำลังเปิด position อยู่ ไม่ต้องเช็คคูลดาวน์การปิด
+                if any(p['symbol'] == symbol for p in self.active_positions):
+                    continue
+                
+                # ดึงประวัติออเดอร์ล่าสุดของเหรียญนั้นๆมา 5 อันดับแรก
+                trades = self.client.futures_get_open_orders(symbol=symbol)
+                # ดึง All Orders เพื่อเช็คออเดอร์ที่พึ่งสำเร็จ (FILLED)
+                all_orders = self.client.futures_get_all_orders(symbol=symbol, limit=5)
+                
+                if all_orders:
+                    # เรียงจากใหม่ไปเก่า
+                    sorted_orders = sorted(all_orders, key=lambda x: x['updateTime'], reverse=True)
+                    last_order = sorted_orders[0]
+                    
+                    # ตรวจสอบว่าเป็นออเดอร์ที่ถูกเติมเต็ม (FILLED) และเป็นการปิด position (Reduce Only หรือเงื่อนไข TP/SL)
+                    if last_order['status'] == 'FILLED' and (last_order.get('reduceOnly') is True or last_order.get('closePosition') is True):
+                        closed_time = datetime.fromtimestamp(last_order['updateTime'] / 1000.0)
+                        # หากเวลาที่ปิดไม่เกิน 5 นาที ให้บันทึกเข้าสู่ระบบคูลดาวน์ป้องกันการเข้าซ้ำ
+                        if datetime.now() - closed_time < timedelta(minutes=TRADE_COOLDOWN_MINUTES):
+                            if symbol not in self.cooldown_trades:
+                                self.cooldown_trades[symbol] = closed_time
+                                self.log(f"{symbol} พึ่งทำการปิดสถานะ! เปิดระบบ Cooldown {TRADE_COOLDOWN_MINUTES} นาที ห้ามเข้าซ้ำ", "WARN")
+        except Exception as e:
+            pass
 
     def update_deep_analysis(self):
         """Macro market analysis focusing on BTC 4H trend."""
@@ -186,6 +220,16 @@ class QuantumUltimateSystem:
     def is_on_cooldown(self, symbol):
         """Checks if a symbol is temporarily blacklisted after a trade."""
         now = datetime.now()
+        
+        # 1. เช็คระบบคูลดาวน์ 5 นาทีจากเหรียญที่เพิ่งปิด (ระบบใหม่ที่เพิ่มเข้ามา)
+        if symbol in self.cooldown_trades:
+            expire_cooldown = self.cooldown_trades[symbol] + timedelta(minutes=TRADE_COOLDOWN_MINUTES)
+            if now < expire_cooldown:
+                return True, f"🔒 CD: {int((expire_cooldown-now).total_seconds())}s"
+            else:
+                del self.cooldown_trades[symbol] # หมดเวลาแล้วลบออกจากระบบคูลดาวน์
+
+        # 2. เช็คระบบ Blacklist 10 นาทีเดิม (ห้ามตัดโค้ดเก่า)
         if symbol in self.closed_trades:
             expire = self.closed_trades[symbol] + timedelta(minutes=BLACKLIST_AUTO_RELEASE_MINUTES)
             if now < expire: 
@@ -201,6 +245,11 @@ class QuantumUltimateSystem:
             # Pre-trade Checks
             if self.account_info["active_orders"] >= MAX_ACTIVE_TRADES: 
                 self.log("Max trades reached. Skipping...", "WARN")
+                return
+
+            # ตรวจสอบเงื่อนไขคูลดาวน์ก่อนเข้าเทรดอีกชั้นหนึ่งเพื่อความปลอดภัย
+            on_cd, _ = self.is_on_cooldown(symbol)
+            if on_cd:
                 return
 
             s_info = self.symbol_info.get(symbol)
@@ -292,6 +341,12 @@ class QuantumUltimateSystem:
             for symbol in self.symbols:
                 self.current_scanning = symbol
                 try:
+                    # ตรวจสอบคูลดาวน์ก่อนดึงข้อมูลเพื่อประหยัด Rate Limit API ล่วงหน้า
+                    on_cd, _ = self.is_on_cooldown(symbol)
+                    if on_cd:
+                        time.sleep(0.05)
+                        continue
+
                     bars = self.client.futures_klines(symbol=symbol, interval="15m", limit=50)
                     df = pd.DataFrame(bars, columns=['t','o','h','l','c','v','ct','qv','tr','tb','tq','ig']).astype(float)
                     
@@ -348,9 +403,11 @@ class QuantumUltimateSystem:
             Layout(name="active", size=12),
             Layout(name="extra", ratio=1)
         )
+        # ปรับการจัดวาง Layout ส่วน extra ให้แบ่งเป็น 3 คอลัมน์ เพื่อรองรับหน้าจอแสดงผลเหรียญคูลดาวน์
         layout["extra"].split_row(
-            Layout(name="analysis"),
-            Layout(name="wallet")
+            Layout(name="analysis", ratio=1),
+            Layout(name="cooldown", ratio=1), # ส่วนที่เพิ่มเข้ามาใหม่เพื่อแสดงผลเหรียญที่ติดคูลดาวน์
+            Layout(name="wallet", ratio=1)
         )
 
         with Live(layout, refresh_per_second=2, screen=True):
@@ -425,6 +482,24 @@ class QuantumUltimateSystem:
 
                 # --- Analysis & Wallet ---
                 layout["analysis"].update(Panel(Align.left(self.deep_analysis_report), title="🛰️ ANALYSIS", border_style="yellow"))
+                
+                # --- Cooldown Display Panel (ส่วนแสดงเหรียญที่ติดคูลดาวน์ 5 นาทีเพิ่มเติม) ---
+                cd_text = Text()
+                now = datetime.now()
+                if not self.cooldown_trades:
+                    cd_text.append("No active cooldowns.\n", style="dim white")
+                    cd_text.append("All clear for trade 🟢", style="green")
+                else:
+                    for sym, closed_time in list(self.cooldown_trades.items()):
+                        expire_cooldown = closed_time + timedelta(minutes=TRADE_COOLDOWN_MINUTES)
+                        rem_seconds = int((expire_cooldown - now).total_seconds())
+                        if rem_seconds > 0:
+                            cd_text.append(f"🔒 {sym}: {rem_seconds}s\n", style="bold red")
+                        else:
+                            if sym in self.cooldown_trades:
+                                del self.cooldown_trades[sym]
+                layout["cooldown"].update(Panel(cd_text, title="⏳ 5M COOLDOWN", border_style="red"))
+
                 w_text = Text.assemble(
                     ("EQUITY: ", "white"), (f"${self.account_info['equity']:.2f}\n", "bold cyan"),
                     ("PNL:    ", "white"), (f"${self.account_info['pnl']:+.2f}", "bold green" if self.account_info['pnl'] >= 0 else "bold red")

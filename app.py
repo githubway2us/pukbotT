@@ -36,24 +36,25 @@ RISK_PER_TRADE = 0.03
 MAX_ACTIVE_TRADES = 6      
 SCAN_INTERVAL = 15 
 BLACKLIST_AUTO_RELEASE_MINUTES = 30 
-TRADE_COOLDOWN_MINUTES = 15 # เพิ่มค่าคงที่สำหรับคูลดาวน์เหรียญที่เพิ่งปิด 15 นาที
+TRADE_COOLDOWN_MINUTES = 15 
 VOL_MULTIPLIER = 1.1      
 
-# New Parameters for TP/SL
+# Parameters for TP/SL
 TP_RATIO = 2.0  # Reward per Risk (e.g., Risk 1 : Reward 2)
 ATR_MULTIPLIER_SL = 1.5
 ATR_MULTIPLIER_TP = ATR_MULTIPLIER_SL * TP_RATIO
 
 # Setup Institutional In-Memory Logging (DISK WRITE PREVENTED FOR HFT SPEED OPTIMIZATION)
 logging.basicConfig(
-    level=logging.CRITICAL, # ยกเลิกการเขียนไฟล์สตรีม ล็อกเฉพาะระดับวิกฤตของระบบภายใน
-    handlers=[logging.NullHandler()] # ผันสายข้อมูลออกจาก Disk Storage ทั้งหมดเพื่อประสิทธิภาพสูงสุด
+    level=logging.CRITICAL, 
+    handlers=[logging.NullHandler()] 
 )
 
 class QuantumUltimateSystem:
     """
     QUANTITATIVE EXECUTION DESK (QED) - INSTITUTIONAL ARBITRAGE & MOMENTUM ENGINE
     Proprietary high-speed liquidity scanner with real-time risk mitigation.
+    Enhanced with Multi-Timeframe (1W/1D) Macro Trend Validation Filter.
     """
     
     def __init__(self):
@@ -69,11 +70,12 @@ class QuantumUltimateSystem:
         
         # State Management
         self.closed_trades = {}      
-        self.cooldown_trades = {} # เพิ่มพื้นที่เก็บข้อมูลคูลดาวน์สำหรับเหรียญที่เพิ่งปิดสัญญา
+        self.cooldown_trades = {} 
         self.market_scores = {} 
         self.market_vol_status = {} 
         self.market_vol_ratio = {}   
         self.price_cache = {}
+        self.macro_trend_cache = {}  # Buffer เก็บค่าแนวโน้มภาพใหญ่ {SYMBOL: "BULLISH" / "BEARISH" / "CONSOLIDATING"}
         self.deep_analysis_report = "Analysing Macro Market Inflow..."
         
         # Account Metadata
@@ -156,7 +158,6 @@ class QuantumUltimateSystem:
                     "active_orders": len(self.active_positions),
                     "last_update": datetime.now().strftime("%H:%M:%S")
                 })
-                # เรียกฟังก์ชันตรวจสอบการปิดสถานะเพื่ออัปเดตระบบคูลดาวน์ 15 นาที
                 self.check_and_update_cooldown()
             except Exception as e:
                 self.log(f"Portfolio Account Synchronization Delayed: {str(e)}", "WARN")
@@ -169,7 +170,6 @@ class QuantumUltimateSystem:
                 if any(p['symbol'] == symbol for p in self.active_positions):
                     continue
                 
-                trades = self.client.futures_get_open_orders(symbol=symbol)
                 all_orders = self.client.futures_get_all_orders(symbol=symbol, limit=5)
                 
                 if all_orders:
@@ -182,7 +182,7 @@ class QuantumUltimateSystem:
                             if symbol not in self.cooldown_trades:
                                 self.cooldown_trades[symbol] = closed_time
                                 self.log(f"Risk Management Active: {symbol} Position Liquidation Completed. Lock Period Triggered.", "WARN")
-        except Exception as e:
+        except Exception:
             pass
 
     def update_deep_analysis(self):
@@ -204,6 +204,54 @@ class QuantumUltimateSystem:
             except Exception: 
                 pass
             time.sleep(30)
+
+    def update_macro_timeframes_cache(self):
+        """
+        Asynchronous Matrix Filter: ดึงข้อมูลโครงสร้างราคาภาพใหญ่จาก 1W และ 1D เพื่อลดภาระการทำงานในสแกนเนอร์หลัก 
+        รันแยกส่วนและแคชผลลัพธ์ไว้เผื่อประสิทธิภาพความเร็วสูงสุด
+        """
+        while True:
+            if not self.symbols:
+                time.sleep(5)
+                continue
+            
+            self.log("Refreshing Institutional 1W/1D Matrix Structures...", "INFO")
+            for symbol in self.symbols.copy():
+                try:
+                    # 1. Weekly Analysis (Primary Trend)
+                    bars_1w = self.client.futures_get_historical_klines(symbol=symbol, interval="1w", start_str="400 weeks ago")
+                    if len(bars_1w) < 200:
+                        # หากเหรียญใหม่มีข้อมูลไม่ถึง 200 แท่งใน 1W จะอนุโลมใช้ข้อมูลทั้งหมดที่มีมาคำนวณแทนเพื่อไม่ให้บอทค้าง
+                        length_w = len(bars_1w) - 1 if len(bars_1w) > 1 else 1
+                    else:
+                        length_w = 200
+                        
+                    df_1w = pd.DataFrame(bars_1w, columns=['t','o','h','l','c','v','ct','qv','tr','tb','tq','ig']).astype(float)
+                    ema200_1w = ta.ema(df_1w['c'], length=length_w)
+                    last_ema200_1w = ema200_1w.iloc[-1] if ema200_1w is not None else df_1w['c'].iloc[-1]
+                    last_close_w = df_1w['c'].iloc[-1]
+
+                    # 2. Daily Analysis (Intermediate Trend)
+                    bars_1d = self.client.futures_klines(symbol=symbol, interval="1d", limit=100)
+                    df_1d = pd.DataFrame(bars_1d, columns=['t','o','h','l','c','v','ct','qv','tr','tb','tq','ig']).astype(float)
+                    ema50_1d = ta.ema(df_1d['c'], length=50)
+                    last_ema50_1d = ema50_1d.iloc[-1] if ema50_1d is not None else df_1d['c'].iloc[-1]
+                    last_close_d = df_1d['c'].iloc[-1]
+
+                    # กำหนดทิศทางภาพใหญ่ที่ผสานรวมกันอย่างสมบูรณ์แบบ
+                    if last_close_w > last_ema200_1w and last_close_d > last_ema50_1d:
+                        self.macro_trend_cache[symbol] = "BULLISH"
+                    elif last_close_w < last_ema200_1w and last_close_d < last_ema50_1d:
+                        self.macro_trend_cache[symbol] = "BEARISH"
+                    else:
+                        self.macro_trend_cache[symbol] = "CONSOLIDATING"  # ไซด์เวย์ขัดแย้งกันระหว่างไทม์เฟรมใหญ่
+                        
+                    time.sleep(0.2) # ป้องกัน IP Rate Limit โดนแบน
+                except Exception:
+                    self.macro_trend_cache[symbol] = "UNKNOWN"
+            
+            # อัปเดตข้อมูลโครงสร้างภาพใหญ่ทุกๆ 1 ชั่วโมง
+            time.sleep(3600)
 
     # --------------------------------------------------------------------------
     # TRADING LOGIC & RISK MITIGATION ENGINE
@@ -229,11 +277,9 @@ class QuantumUltimateSystem:
         """
         Execute market orders with automatic Take Profit and Stop Loss.
         Uses ATR for dynamic TP/SL distance calculation.
-        
-        Strict Institutional Protocol: Pyramiding Block implemented to prevent manual/automated averaging down.
         """
         try:
-            # NO ORDER PYRAMIDING CHECK (ป้องกันออเดอร์ที่เข้าแล้วเด็ดขาด ไม่มีการช้อนเพิ่ม)
+            # NO ORDER PYRAMIDING CHECK
             if any(position['symbol'] == symbol for position in self.active_positions):
                 return
 
@@ -258,7 +304,7 @@ class QuantumUltimateSystem:
 
             if side == SIDE_BUY:
                 sl = round(entry - sl_dist, p_prec)
-                tp = round(entry - tp_dist, p_prec) 
+                tp = round(entry + tp_dist, p_prec) # FIX BUG: โค้ดเก่าลบออก ตอนนี้ปรับเปลี่ยนแก้เป็นบวกเรียบร้อยสำหรับฝั่งซื้อทำกำไรด้านบน
                 exit_side = SIDE_SELL
             else:
                 sl = round(entry + sl_dist, p_prec)
@@ -291,7 +337,7 @@ class QuantumUltimateSystem:
                 stopPrice=sl, closePosition=True
             )
 
-            # 4. Take Profit (Take Profit Market or Limit)
+            # 4. Take Profit (Take Profit Market)
             self.client.futures_create_order(
                 symbol=symbol, side=exit_side,
                 type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
@@ -304,7 +350,7 @@ class QuantumUltimateSystem:
             self.log(f"Order Placement Interrupted by Liquidity Engine: {str(e)}", "ERROR")
 
     def scanner_loop(self):
-        """Main loop for technical scanning and volume analysis."""
+        """Main loop for technical scanning and volume analysis with Macro Trend Filters."""
         try:
             tickers = self.client.futures_ticker()
             self.symbols = [x["symbol"] for x in sorted(tickers, key=lambda x: float(x["quoteVolume"]), reverse=True)[:TOP_N] if x["symbol"].endswith("USDT")]
@@ -354,13 +400,18 @@ class QuantumUltimateSystem:
                     rsi = ta.rsi(df['c']).iloc[-1]
                     self.market_scores[symbol] = 3 if (rsi < 35 or rsi > 65) else 1
                     
+                    # ตรวจสอบตัวกรองทิศทางภาพใหญ่จาก 1W / 1D Cache
+                    macro_direction = self.macro_trend_cache.get(symbol, "UNKNOWN")
+
                     if self.market_vol_status[symbol] and self.account_info["active_orders"] < MAX_ACTIVE_TRADES:
-                        if rsi < 30:
+                        # เงื่อนไข BUY: สัญญาณ RSI บ่งชี้จุดกลับตัว และ ภาพใหญ่ 1W/1D ต้องเป็น BULLISH เท่านั้น
+                        if rsi < 30 and macro_direction == "BULLISH":
                             self.execute_trade(symbol, SIDE_BUY, df['c'].iloc[-1], atr)
-                        elif rsi > 70:
+                        # เงื่อนไข SELL: สัญญาณ RSI บ่งชี้จุดกลับตัว และ ภาพใหญ่ 1W/1D ต้องเป็น BEARISH เท่านั้น
+                        elif rsi > 70 and macro_direction == "BEARISH":
                             self.execute_trade(symbol, SIDE_SELL, df['c'].iloc[-1], atr)
 
-                    time.sleep(0.1) 
+                    time.sleep(0.05) 
                 except Exception: 
                     continue
             self.ping = int((time.time() - start_time) * 1000)
@@ -374,6 +425,7 @@ class QuantumUltimateSystem:
         threading.Thread(target=self.start_ticker_websocket, daemon=True).start()
         threading.Thread(target=self.update_account_core, daemon=True).start()
         threading.Thread(target=self.update_deep_analysis, daemon=True).start()
+        threading.Thread(target=self.update_macro_timeframes_cache, daemon=True).start() # เริ่มทำงานระบบกรองเทรนด์ภาพใหญ่
         threading.Thread(target=self.scanner_loop, daemon=True).start()
         
         layout = Layout()
@@ -405,34 +457,44 @@ class QuantumUltimateSystem:
                 # --- Header Render ---
                 header_text = Text.assemble(
                     (" institutional Quantitative Desk ", "bold black on bright_white"), 
-                    ("  SYSTEM NODE: CORE-ENG-v4.0.0", "white"),
+                    ("  SYSTEM NODE: CORE-ENG-v4.1.0", "white"),
                     (" | ", "dim"), 
                     (f"NETWORK LATENCY: {self.ping}ms", "bright_green" if self.ping < 1500 else "bright_red")
                 )
                 layout["header"].update(Panel(Align.center(header_text), subtitle=f"Current Asset In-Focus: {self.current_scanning}", border_style="white", box=box.SQUARE))
 
-                # --- Market Scanner ---
+                # --- Market Scanner (Enhanced with Macro Structure View) ---
                 m_table = Table(expand=True, box=box.SQUARE, padding=(0,1))
                 m_table.add_column("RANK", justify="center", style="dim")
                 m_table.add_column("ASSET CLASS", style="bright_cyan")
                 m_table.add_column("MARK PRICE", justify="right", style="bright_white") 
-                m_table.add_column("SIGMA SCORE", justify="center")
+                m_table.add_column("MACRO FILTER", justify="center") # แสดงผลทิศทางภาพใหญ่ 1W+1D บนหน้าจอ
                 m_table.add_column("FLOW", justify="center")
-                m_table.add_column("ALLOCATION STATUS")
+                m_table.add_column("ALLOCATION")
 
                 for i, s in enumerate(self.symbols[:25]):
                     hold, reason = self.is_on_cooldown(s)
                     price = self.get_symbol_price(s)
                     price_str = f"{price:,.6f}" if price < 1 else f"{price:,.2f}"
                     
+                    macro = self.macro_trend_cache.get(s, "SCANNING")
+                    if macro == "BULLISH":
+                        macro_color = "[bold bright_green]▲ BULL[/]"
+                    elif macro == "BEARISH":
+                        macro_color = "[bold red]▼ BEAR[/]"
+                    elif macro == "CONSOLIDATING":
+                        macro_color = "[yellow]■ SIDE[/]"
+                    else:
+                        macro_color = "[dim white]● SYNC[/]"
+
                     flow_indicator = "[bright_green]STABLE[/]" if self.market_scores.get(s,1) == 1 else "[bold magenta]IMBALANCE[/]"
                     m_table.add_row(
                         str(i+1), s, price_str, 
-                        f"RANK {self.market_scores.get(s,0)}",
+                        macro_color,
                         flow_indicator, 
                         f"[bold orange1]{reason}[/]" if hold else "[bold green]ELIGIBLE[/]"
                     )
-                layout["market"].update(Panel(m_table, title="📡 CORE MARKET FLOW ANALYSIS ENGINE", border_style="white", box=box.SQUARE))
+                layout["market"].update(Panel(m_table, title="📡 CORE MARKET FLOW ANALYSIS ENGINE (1W/1D MATRIX FILTERED)", border_style="white", box=box.SQUARE))
 
                 # --- Order Flow Imbalances (OFI) ---
                 v_table = Table(expand=True, box=box.SQUARE)
@@ -445,13 +507,13 @@ class QuantumUltimateSystem:
                     v_table.add_row(sym, f"{rat:.2f}x", action)
                 layout["vol_spike"].update(Panel(v_table, title="⚡ ORDER FLOW IMBALANCE DETECTOR (OFI)", border_style="white", box=box.SQUARE))
 
-                # --- Active Positions (Enhanced with Real-time Direction Forecast Engine) ---
+                # --- Active Positions ---
                 p_table = Table(expand=True, box=box.SQUARE)
                 p_table.add_column("ASSET", style="bright_white", no_wrap=True)
                 p_table.add_column("DIRECTION", justify="center")
                 p_table.add_column("STRIKE ENTRY", justify="right", style="bright_yellow")
                 p_table.add_column("UNREALIZED ($)", justify="right")
-                p_table.add_column("DIRECTION FORECAST", justify="center") # คอลัมน์พยากรณ์ราคาขึ้น/ลงเรียลไทม์ที่เพิ่มขึ้นมา
+                p_table.add_column("DIRECTION FORECAST", justify="center") 
 
                 for p in self.active_positions.copy():
                     pos_amt = float(p.get('positionAmt', 0))
@@ -462,40 +524,23 @@ class QuantumUltimateSystem:
                     entry_price = float(p.get('entryPrice', 0))
                     pnl = float(p.get('unrealizedProfit', 0))
                     
-                    # REAL-TIME DIRECTION FORECAST LOGIC (ดึงราคาตลาดสดจาก WebSocket Buffer มาคำนวณเวกเตอร์โมเมนตัมปัจจุบัน)
                     current_spot_price = self.get_symbol_price(symbol)
-                    
                     if current_spot_price > 0:
                         price_diff_pct = ((current_spot_price - entry_price) / entry_price) * 100
-                        
-                        if pos_amt > 0: # สำหรับออเดอร์ฝั่ง LONG
-                            if price_diff_pct > 0.4:
-                                forecast_signal = "[blink bright_green]▲ ACCELERATING[/]" # กำลังขึ้นแรงมาก
-                            elif price_diff_pct > 0:
-                                forecast_signal = "[bright_green]▲ BULLISH HOLD[/]"   # ค่อยๆ ขึ้น/ทรงตัวแดนบวก
-                            elif price_diff_pct < -0.4:
-                                forecast_signal = "[blink red]▼ LIQUIDATING[/]"       # ราคากำลังดิ่งลงลึก
-                            else:
-                                forecast_signal = "[red]▼ BEARISH HOLD[/]"          # ติดลบเล็กน้อยทรงตัวแดนลบ
-                        else: # สำหรับออเดอร์ฝั่ง SHORT
-                            if price_diff_pct < -0.4:
-                                forecast_signal = "[blink bright_green]▲ ACCELERATING[/]" # กำลังลงแรงมาก (บวกสัญญาสั้น)
-                            elif price_diff_pct < 0:
-                                forecast_signal = "[bright_green]▲ BULLISH HOLD[/]"   # กำลังลง/ทรงตัวแดนบวกของ Short
-                            elif price_diff_pct > 0.4:
-                                forecast_signal = "[blink red]▼ LIQUIDATING[/]"       # ราคากำลังพุ่งสวนทางทุบสัญญาสั้น
-                            else:
-                                forecast_signal = "[red]▼ BEARISH HOLD[/]"          # ขาดทุนเล็กน้อยทรงตัวแดนลบ
+                        if pos_amt > 0:
+                            if price_diff_pct > 0.4: forecast_signal = "[blink bright_green]▲ ACCELERATING[/]"
+                            elif price_diff_pct > 0: forecast_signal = "[bright_green]▲ BULLISH HOLD[/]"
+                            elif price_diff_pct < -0.4: forecast_signal = "[blink red]▼ LIQUIDATING[/]"
+                            else: forecast_signal = "[red]▼ BEARISH HOLD[/]"
+                        else:
+                            if price_diff_pct < -0.4: forecast_signal = "[blink bright_green]▲ ACCELERATING[/]"
+                            elif price_diff_pct < 0: forecast_signal = "[bright_green]▲ BULLISH HOLD[/]"
+                            elif price_diff_pct > 0.4: forecast_signal = "[blink red]▼ LIQUIDATING[/]"
+                            else: forecast_signal = "[red]▼ BEARISH HOLD[/]"
                     else:
-                        forecast_signal = "[dim white]■ CONSOLIDATING[/]"           # ขาดการเชื่อมต่อ/ราคาคงที่ชั่วคราว
+                        forecast_signal = "[dim white]■ CONSOLIDATING[/]"
                     
-                    p_table.add_row(
-                        symbol, 
-                        side_text, 
-                        f"{entry_price:,.4f}",
-                        f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.2f}[/]", 
-                        forecast_signal
-                    )
+                    p_table.add_row(symbol, side_text, f"{entry_price:,.4f}", f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.2f}[/]", forecast_signal)
                 layout["active"].update(Panel(p_table, title="⚔️ INSTITUTIONAL ACTIVE RISK EXPOSURE", border_style="bright_green", box=box.SQUARE))
 
                 # --- Macro Analysis & Capital Portfolio ---
